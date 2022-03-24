@@ -208,6 +208,7 @@ func k8s_apply(path string) {
 		fmt.Printf("[%s] Failed to create Kubernetes Clientset.\n", color.RedString("ERR"))
 
 	}
+	log.Info(clientset)
 
 	b, err := ioutil.ReadFile(path)
 	if err != nil {

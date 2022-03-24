@@ -176,17 +176,14 @@ func policy_read(policy_name string, namespace string, labels string) {
 		}
 
 		file.Close()
-		f, err := os.OpenFile("policy_updated.yaml", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Error(err)
-			return
-		}
+
 		for _, each_ln := range text {
-			_, err = fmt.Fprintln(f, each_ln)
+			_, err = fmt.Fprintln(policy_updated, each_ln)
 			if err != nil {
 				log.Error(err)
 			}
 		}
+		policy_updated.Close()
 
 	}
 
@@ -254,7 +251,10 @@ func k8s_apply(path string) {
 		mapper := restmapper.NewDiscoveryRESTMapper(gr)
 		mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 		if err != nil {
-			log.Fatal(err)
+			log.Error(err)
+			fmt.Printf("[%s] Error: %v\n", color.RedString("ERR"), err)
+		} else {
+			policy_count++
 		}
 
 		var dri dynamic.ResourceInterface
@@ -272,7 +272,7 @@ func k8s_apply(path string) {
 			log.Error("Apply error: %v", err)
 			fmt.Printf("[%s] Error in Applying Policy\n", color.RedString("ERR"))
 		}
-		policy_count++
+
 	}
 	if err != io.EOF {
 		log.Error("End of File ", err)
@@ -310,12 +310,6 @@ func k8s_labels(flag bool) {
 	for i, item := range temp {
 		log.Info("Label values", i+1, item)
 	}
-
-	if flag == false {
-		log.Info("Received flag value false")
-		fmt.Printf("[%s][%s] Halting execution because auto-apply is not enabled\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.CyanString("WRN"))
-		os.Exit(0)
-	}
 	s.Prefix = "Searching the policy-template repository for policies with keyword " + keyword + ". Please wait.."
 	s.Start()
 	time.Sleep(4 * time.Second)
@@ -328,7 +322,12 @@ func k8s_labels(flag bool) {
 			policy_search(pod.GetNamespace(), labels)
 		}
 	}
-	fmt.Printf("[%s][%s] Policy file found at %s\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("File Details"), color.GreenString(current_dir+"/policy_updated.yaml"))
+	fmt.Printf("[%s][%s] Policy file created at %s\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("File Details"), color.GreenString(current_dir+"/policy_updated.yaml"))
+	if flag == false {
+		log.Info("Received flag value false")
+		fmt.Printf("[%s][%s] Halting execution because auto-apply is not enabled\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.CyanString("WRN"))
+		os.Exit(0)
+	}
 	fmt.Printf("[%s][%s] Started applying policies\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("INIT"))
 	k8s_apply(current_dir + "/policy_updated.yaml")
 
@@ -381,6 +380,7 @@ func delete_all() {
 }
 
 var version string = "1.0.0"
+var policy_updated *os.File
 
 func main() {
 
@@ -391,7 +391,7 @@ func main() {
 
 	log.SetFormatter(&log.JSONFormatter{})
 
-	log_file, err := os.OpenFile("logs.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+	log_file, err := os.OpenFile("logs.log", os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -406,6 +406,12 @@ func main() {
 	user_home, err = os.UserHomeDir()
 	if err != nil {
 		log.Error(err)
+	}
+
+	policy_updated, err = os.OpenFile("policy_updated.yaml", os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Error(err)
+		return
 	}
 
 	// adding policy-template directory to current working directory

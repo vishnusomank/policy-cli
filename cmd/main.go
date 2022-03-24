@@ -183,8 +183,6 @@ func policy_read(policy_name string, namespace string, labels string) {
 				log.Error(err)
 			}
 		}
-		policy_updated.Close()
-
 	}
 
 }

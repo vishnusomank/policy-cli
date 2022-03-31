@@ -35,7 +35,7 @@ import (
 	clientcmd "k8s.io/client-go/tools/clientcmd"
 )
 
-var current_dir, git_dir, user_home, keyword string
+var current_dir, git_dir, user_home, keyword, tags string
 var s = spinner.New(spinner.CharSets[9], 100*time.Millisecond)
 var policy_count int = 0
 
@@ -108,9 +108,12 @@ func connectToK8s() *kubernetes.Clientset {
 func createKeyValuePairs(m map[string]string) string {
 
 	log.Info("Started map to string conversion on labels")
+
 	b := new(bytes.Buffer)
 	for key, value := range m {
 		if strings.Contains(key, keyword) || strings.Contains(value, keyword) {
+			fmt.Fprintf(b, "%s: %s\n", key, value)
+		} else if tags != "" && keyword == "" {
 			fmt.Fprintf(b, "%s: %s\n", key, value)
 		}
 	}
@@ -140,13 +143,13 @@ func policy_search(namespace string, labels string) {
 
 func policy_read(policy_name string, namespace string, labels string) {
 
-	log.Info("Started Policy search with keyword '" + keyword + "'")
+	log.Info("Started Policy search with keyword '" + keyword + "' and tags '" + tags + "'")
 
 	content, err := os.ReadFile(policy_name)
 	if err != nil {
 		log.Error(err)
 	}
-	if strings.Contains(string(content), keyword) {
+	if strings.Contains(string(content), keyword) || (strings.Contains(string(content), tags) && tags != "") {
 
 		file, err := os.Open(policy_name)
 		if err != nil {
@@ -289,13 +292,21 @@ func k8s_labels(flag bool) {
 	}
 	var temp []string
 	var count int = 0
-	for _, pod := range pods.Items {
+	if tags == "" && keyword != "" {
 		s.Prefix = "Searching the Kubernetes Cluster for keyword " + keyword + ". Please wait.. "
-		s.Start()
-		time.Sleep(4 * time.Second)
-		if createKeyValuePairs(pod.GetLabels()) != "" {
-			temp = append(temp, createKeyValuePairs(pod.GetLabels()))
-			count++
+	} else if tags != "" && keyword != "" {
+		s.Prefix = "Searching the Kubernetes Cluster for keyword " + keyword + " and tags " + tags + ". Please wait.. "
+	} else {
+		s.Prefix = "Searching the Kubernetes Cluster for labels. Please wait.. "
+	}
+	for _, pod := range pods.Items {
+		if !strings.Contains(pod.GetNamespace(), "kube-system") {
+			s.Start()
+			time.Sleep(4 * time.Second)
+			if createKeyValuePairs(pod.GetLabels()) != "" {
+				temp = append(temp, createKeyValuePairs(pod.GetLabels()))
+				count++
+			}
 		}
 	}
 	s.Stop()
@@ -306,10 +317,14 @@ func k8s_labels(flag bool) {
 	} else {
 		fmt.Printf("[%s][%s] Found %d Labels\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("Label Details"), count)
 	}
-	for i, item := range temp {
-		log.Info("Label values", i+1, item)
+	for _, item := range temp {
+		log.Info("Label values: ", item)
 	}
-	s.Prefix = "Searching the policy-template repository for policies with keyword " + keyword + ". Please wait.."
+	if tags == "" && keyword != "" {
+		s.Prefix = "Searching the Kubernetes Cluster for keyword " + keyword + ". Please wait.. "
+	} else if tags != "" && keyword != "" {
+		s.Prefix = "Searching the Kubernetes Cluster for keyword " + keyword + " and tags " + tags + ". Please wait.. "
+	}
 	s.Start()
 	time.Sleep(4 * time.Second)
 	s.Stop()
@@ -317,8 +332,10 @@ func k8s_labels(flag bool) {
 		labels := createKeyValuePairs(pod.GetLabels())
 		labels = strings.TrimSuffix(labels, "\n")
 		if labels != "" {
-			fmt.Printf("[%s][%s] Pod: %s || Labels: %s || Namespace: %s\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("Label Details"), pod.GetName(), labels, pod.GetNamespace())
-			policy_search(pod.GetNamespace(), labels)
+			if !strings.Contains(pod.GetNamespace(), "kube-system") {
+				fmt.Printf("[%s][%s] Pod: %s || Labels: %s || Namespace: %s\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("Label Details"), pod.GetName(), labels, pod.GetNamespace())
+				policy_search(pod.GetNamespace(), labels)
+			}
 		}
 	}
 	fmt.Printf("[%s][%s] Policy file created at %s\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("File Details"), color.GreenString(current_dir+"/policy_updated.yaml"))
@@ -359,17 +376,11 @@ func git_operation() {
 
 }
 func delete_all() {
-	file1 := current_dir + "/logs.log"
-	file2 := current_dir + "/policy_updated.yaml"
-	err := os.RemoveAll(file1)
+	logs_path := current_dir + "/logs.log"
+	err := os.RemoveAll(logs_path)
 	if err != nil {
 		log.Error(err)
-		fmt.Printf("[%s] Unable to remove file %s\n", color.RedString("ERR"), file1)
-	}
-	err = os.RemoveAll(file2)
-	if err != nil {
-		log.Error(err)
-		fmt.Printf("[%s] Unable to remove file %s\n", color.RedString("ERR"), file2)
+		fmt.Printf("[%s] Unable to remove file %s\n", color.RedString("ERR"), logs_path)
 	}
 	err = os.RemoveAll(git_dir)
 	if err != nil {
@@ -435,6 +446,20 @@ func main() {
 			Destination: new(string),
 			HasBeenSet:  false,
 		},
+		&cli.StringFlag{
+			Name:        "tags",
+			Aliases:     []string{"t"},
+			Usage:       "Tags to search. Example 'MITRE'",
+			EnvVars:     []string{},
+			FilePath:    "",
+			Required:    false,
+			Hidden:      false,
+			TakesFile:   false,
+			Value:       "",
+			DefaultText: "",
+			Destination: new(string),
+			HasBeenSet:  false,
+		},
 		&cli.BoolFlag{
 			Name:        "persist",
 			Aliases:     []string{"p"},
@@ -466,16 +491,16 @@ func main() {
 		Name:      "knox-autopol",
 		Usage:     "A simple CLI tool to automatically generate and apply policies",
 		Version:   version,
-		UsageText: "knox-autopol [Flags]\nEg. knox-autopol --keyword=wordpress --auto-apply=true --persist=true",
+		UsageText: "knox-autopol [Flags]\nEg. knox-autopol --keyword=wordpress --tags=mitre --auto-apply=true --persist=true",
 		Flags:     myFlags,
 		Action: func(c *cli.Context) error {
-			if c.String("keyword") == "" && c.Bool("persist") == true && c.Bool("auto-apply") == false {
+			if c.String("keyword") == "" && c.String("tags") == "" && c.Bool("persist") == true && c.Bool("auto-apply") == false {
 
 				banner()
-				fmt.Printf("[%s] No Keyword found. Please use knox_autopol --help for help menu\n", color.RedString("ERR"))
+				fmt.Printf("[%s] No Keyword or tags found. Please use knox_autopol --help for help menu\n", color.RedString("ERR"))
 
 			}
-			if c.String("keyword") != "" {
+			if c.String("keyword") != "" && c.String("tags") == "" {
 				keyword = c.String("keyword")
 				banner()
 				fmt.Printf("[%s] Using Knox AutoPol Engine %s\n", color.BlueString("INF"), color.GreenString(version))
@@ -485,6 +510,31 @@ func main() {
 					delete_all()
 				}
 				fmt.Printf("[%s][%s] Successfully applied %d policies\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.GreenString("DONE"), policy_count)
+			} else if c.String("keyword") == "" && c.String("tags") != "" {
+
+				tags = c.String("tags")
+				banner()
+				fmt.Printf("[%s] Using Knox AutoPol Engine %s\n", color.BlueString("INF"), color.GreenString(version))
+				git_operation()
+				k8s_labels(c.Bool("auto-apply"))
+				if c.Bool("persist") == false {
+					delete_all()
+				}
+				fmt.Printf("[%s][%s] Successfully applied %d policies\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.GreenString("DONE"), policy_count)
+
+			} else if c.String("keyword") != "" && c.String("tags") != "" {
+
+				keyword = c.String("keyword")
+				tags = c.String("tags")
+				banner()
+				fmt.Printf("[%s] Using Knox AutoPol Engine %s\n", color.BlueString("INF"), color.GreenString(version))
+				git_operation()
+				k8s_labels(c.Bool("auto-apply"))
+				if c.Bool("persist") == false {
+					delete_all()
+				}
+				fmt.Printf("[%s][%s] Successfully applied %d policies\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.GreenString("DONE"), policy_count)
+
 			}
 			return nil
 		},

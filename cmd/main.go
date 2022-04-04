@@ -38,6 +38,7 @@ import (
 var current_dir, git_dir, user_home, keyword, tags string
 var s = spinner.New(spinner.CharSets[9], 100*time.Millisecond)
 var policy_count int = 0
+var label_count int = 0
 
 // function to clone policy-template repo to current working directory
 func git_clone() {
@@ -105,16 +106,26 @@ func connectToK8s() *kubernetes.Clientset {
 }
 
 // Function to create strings from key-value pairs
-func createKeyValuePairs(m map[string]string) string {
+func createKeyValuePairs(m map[string]string, disp bool) string {
 
 	log.Info("Started map to string conversion on labels")
 
 	b := new(bytes.Buffer)
-	for key, value := range m {
-		if strings.Contains(key, keyword) || strings.Contains(value, keyword) {
-			fmt.Fprintf(b, "%s: %s\n", key, value)
-		} else if tags != "" && keyword == "" {
-			fmt.Fprintf(b, "%s: %s\n", key, value)
+	if disp == true {
+		for key, value := range m {
+			if strings.Contains(key, keyword) || strings.Contains(value, keyword) {
+				fmt.Fprintf(b, "%s: %s\n\t\t\t\t\t", key, value)
+			} else if tags != "" && keyword == "" {
+				fmt.Fprintf(b, "%s: %s\n\t\t\t\t\t", key, value)
+			}
+		}
+	} else {
+		for key, value := range m {
+			if strings.Contains(key, keyword) || strings.Contains(value, keyword) {
+				fmt.Fprintf(b, "%s: %s\n      ", key, value)
+			} else if tags != "" && keyword == "" {
+				fmt.Fprintf(b, "%s: %s\n      ", key, value)
+			}
 		}
 	}
 	return b.String()
@@ -131,6 +142,7 @@ func policy_search(namespace string, labels string) {
 			return err
 		}
 		if strings.Contains(path, ".yaml") {
+			label_count = 0
 			policy_read(path, namespace, labels)
 		}
 		return nil
@@ -149,7 +161,8 @@ func policy_read(policy_name string, namespace string, labels string) {
 	if err != nil {
 		log.Error(err)
 	}
-	if strings.Contains(string(content), keyword) || (strings.Contains(string(content), tags) && tags != "") {
+
+	if strings.Contains(string(content), tags) && tags != "" {
 
 		file, err := os.Open(policy_name)
 		if err != nil {
@@ -167,8 +180,50 @@ func policy_read(policy_name string, namespace string, labels string) {
 					}
 				}
 
-			} else if strings.Contains(string(scanner.Text()), "matchLabels:") {
+			} else if strings.Contains(string(scanner.Text()), "matchLabels:") && label_count == 0 {
 				text = append(text, "    matchLabels:\n      "+labels)
+				label_count = 1
+				for scanner.Scan() {
+					if strings.Contains(string(scanner.Text()), "file:") || strings.Contains(string(scanner.Text()), "process:") || strings.Contains(string(scanner.Text()), "network:") || strings.Contains(string(scanner.Text()), "capabilities:") || strings.Contains(string(scanner.Text()), "ingress") || strings.Contains(string(scanner.Text()), "egress") {
+						break
+					}
+				}
+			}
+			text = append(text, scanner.Text())
+		}
+
+		file.Close()
+
+		for _, each_ln := range text {
+			_, err = fmt.Fprintln(policy_updated, each_ln)
+			if err != nil {
+				log.Error(err)
+			}
+		}
+
+	}
+
+	if strings.Contains(string(content), keyword) && keyword != "" {
+
+		file, err := os.Open(policy_name)
+		if err != nil {
+			log.Fatal(err)
+		}
+		scanner := bufio.NewScanner(file)
+		var text []string
+		text = append(text, "---")
+		for scanner.Scan() {
+			if strings.Contains(string(scanner.Text()), "namespace:") {
+				text = append(text, "  namespace: "+namespace)
+				for scanner.Scan() {
+					if strings.Contains(string(scanner.Text()), "spec:") {
+						break
+					}
+				}
+
+			} else if strings.Contains(string(scanner.Text()), "matchLabels:") && label_count == 0 {
+				text = append(text, "    matchLabels:\n      "+labels)
+				label_count = 1
 				for scanner.Scan() {
 					if strings.Contains(string(scanner.Text()), "file:") || strings.Contains(string(scanner.Text()), "process:") || strings.Contains(string(scanner.Text()), "network:") || strings.Contains(string(scanner.Text()), "capabilities:") || strings.Contains(string(scanner.Text()), "ingress") || strings.Contains(string(scanner.Text()), "egress") {
 						break
@@ -303,8 +358,8 @@ func k8s_labels(flag bool) {
 		if !strings.Contains(pod.GetNamespace(), "kube-system") {
 			s.Start()
 			time.Sleep(4 * time.Second)
-			if createKeyValuePairs(pod.GetLabels()) != "" {
-				temp = append(temp, createKeyValuePairs(pod.GetLabels()))
+			if createKeyValuePairs(pod.GetLabels(), true) != "" {
+				temp = append(temp, createKeyValuePairs(pod.GetLabels(), true))
 				count++
 			}
 		}
@@ -315,9 +370,12 @@ func k8s_labels(flag bool) {
 		fmt.Printf("[%s] No labels found in the cluster. Gracefully exiting program.\n", color.RedString("ERR"))
 		os.Exit(0)
 	} else {
-		fmt.Printf("[%s][%s] Found %d Labels\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("Label Details"), count)
+		fmt.Printf("[%s][%s] Found %d Labels\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("Label Count"), count)
 	}
 	for _, item := range temp {
+		val := strings.TrimSuffix(item, "\n\t\t\t\t\t")
+
+		fmt.Printf("[%s][%s]    %s\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("Label Details"), val)
 		log.Info("Label values: ", item)
 	}
 	if tags == "" && keyword != "" {
@@ -327,20 +385,21 @@ func k8s_labels(flag bool) {
 	}
 	s.Start()
 	time.Sleep(4 * time.Second)
-	s.Stop()
 	for _, pod := range pods.Items {
-		labels := createKeyValuePairs(pod.GetLabels())
-		labels = strings.TrimSuffix(labels, "\n")
+		labels := createKeyValuePairs(pod.GetLabels(), false)
+		labels = strings.TrimSuffix(labels, "\n      ")
 		if labels != "" {
 			if !strings.Contains(pod.GetNamespace(), "kube-system") {
-				fmt.Printf("[%s][%s] Pod: %s || Labels: %s || Namespace: %s\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("Label Details"), pod.GetName(), labels, pod.GetNamespace())
+				//	fmt.Printf("[%s][%s] Pod: %s || Labels: %s || Namespace: %s\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("Label Details"), pod.GetName(), labels, pod.GetNamespace())
 				policy_search(pod.GetNamespace(), labels)
 			}
 		}
 	}
+	s.Stop()
 	fmt.Printf("[%s][%s] Policy file created at %s\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("File Details"), color.GreenString(current_dir+"/policy_updated.yaml"))
 	if flag == false {
 		log.Info("Received flag value false")
+
 		fmt.Printf("[%s][%s] Halting execution because auto-apply is not enabled\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.CyanString("WRN"))
 		os.Exit(0)
 	}
@@ -510,6 +569,7 @@ func main() {
 					delete_all()
 				}
 				fmt.Printf("[%s][%s] Successfully applied %d policies\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.GreenString("DONE"), policy_count)
+
 			} else if c.String("keyword") == "" && c.String("tags") != "" {
 
 				tags = c.String("tags")

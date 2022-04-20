@@ -203,7 +203,7 @@ func policy_read(policy_name string, namespace string, labels string) {
 
 	}
 
-	if strings.Contains(string(content), keyword) && keyword != "" {
+	if strings.Contains(string(content), keyword) && keyword != "" && tags == "" {
 
 		file, err := os.Open(policy_name)
 		if err != nil {

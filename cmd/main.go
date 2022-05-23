@@ -7,21 +7,29 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"os/exec"
+
+	myhttp "net/http"
+
 	"github.com/briandowns/spinner"
 	"github.com/common-nighthawk/go-figure"
 	"github.com/fatih/color"
 	"github.com/go-git/go-git/v5"
-	"github.com/pytimer/k8sutil/apply"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/transport/http"
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
-	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -35,10 +43,198 @@ import (
 	clientcmd "k8s.io/client-go/tools/clientcmd"
 )
 
-var current_dir, git_dir, user_home, keyword, tags string
+const CREATE = "Create"
+const APPLY = "Apply"
+const DELETE = "Delete"
+const LATEST = "latest"
+
+const CILIUM_VESION = "cilium.io/v2"
+const CILIUM_KIND = "CiliumNetworkPolicy"
+const CILIUM_KIND_NODE_LABEL = "CiliumClusterwideNetworkPolicy"
+
+const FORMAT_STRING = "%s:%s@tcp(%s:%s)/%s"
+
+const UPDATE = "Update"
+
+const SUCCESS = "success"
+
+const SYSTEM_API_VERSION = "security.kubearmor.com/v1"
+const KUBEARMORHOST_POLICY = "KubeArmorHostPolicy"
+const KUBEARMOR_POLICY = "KubeArmorPolicy"
+const GCP = "GCP"
+
+var current_dir, git_dir, user_home, keyword, tags, ad_dir string
 var s = spinner.New(spinner.CharSets[9], 100*time.Millisecond)
 var policy_count int = 0
 var label_count int = 0
+var autoapply bool
+
+var git_username, git_token, git_repo_url, git_branch_name, git_repo_path, git_policy_name string
+
+const repo_path = "/tmp/accuknox-client-repo"
+
+// Git Functions
+
+func Init_Git(username string, token string, repo_url string, branch_name string) {
+
+	r := GitClone(username, token, repo_url, repo_path)
+
+	createBranch(r, username, token, branch_name)
+	fmt.Printf("%v branch is created\n", branch_name)
+
+	pushToGithub(r, username, token)
+	fmt.Printf("Pushed to the github repo %v\n", repo_url)
+
+	removeLocalRepo()
+}
+
+func GitClone(username string, token string, repo_url string, repo_path string) *git.Repository {
+
+	create_dir := os.Mkdir(repo_path, 0755)
+
+	checkError(create_dir)
+
+	auth := &http.BasicAuth{
+		Username: username,
+		Password: token,
+	}
+
+	r, _ := git.PlainClone(repo_path, false, &git.CloneOptions{
+		URL:  repo_url,
+		Auth: auth,
+	})
+
+	return r
+}
+
+func createBranch(r *git.Repository, username string, token string, branch_name string) {
+
+	w, _ := r.Worktree()
+
+	err := w.Checkout(&git.CheckoutOptions{
+		Create: true,
+		Force:  false,
+		Branch: "main",
+	})
+
+	checkError(err)
+
+	branchName := plumbing.ReferenceName("refs/heads/" + branch_name)
+
+	err = w.Checkout(&git.CheckoutOptions{
+		Create: true,
+		Force:  false,
+		Branch: branchName,
+	})
+
+	checkError(err)
+	create_dir := os.Mkdir(git_repo_path, 0755)
+
+	checkError(create_dir)
+	k8s_labels(autoapply)
+
+	CopyDir(git_repo_path, repo_path)
+	w.Add(".")
+
+	author := &object.Signature{
+		Name:  "KnoxAutoPol",
+		Email: "vishnu@accuknox.com",
+		When:  time.Now(),
+	}
+
+	w.Commit("Commit from KnoxAutoPol CLI", &git.CommitOptions{Author: author})
+}
+
+func pushToGithub(r *git.Repository, username, password string) {
+
+	auth := &http.BasicAuth{
+		Username: username,
+		Password: password,
+	}
+
+	err := r.Push(&git.PushOptions{
+		RemoteName: "origin",
+		Auth:       auth,
+		Force:      true,
+	})
+
+	checkError(err)
+}
+
+func removeLocalRepo() {
+
+	err := os.RemoveAll(repo_path)
+	checkError(err)
+	err = os.RemoveAll(git_repo_path)
+	checkError(err)
+}
+
+func checkError(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func CopyDir(src string, dst string) error {
+	var err error
+	var fds []os.FileInfo
+	var srcinfo os.FileInfo
+
+	if srcinfo, err = os.Stat(src); err != nil {
+		return err
+	}
+
+	if err = os.MkdirAll(dst, srcinfo.Mode()); err != nil {
+		return err
+	}
+
+	if fds, err = ioutil.ReadDir(src); err != nil {
+		return err
+	}
+
+	for _, fd := range fds {
+		srcfp := path.Join(src, fd.Name())
+		dstfp := path.Join(dst, fd.Name())
+
+		if fd.IsDir() {
+			if err = CopyDir(srcfp, dstfp); err != nil {
+				fmt.Println(err)
+			}
+		} else {
+			if err = file(srcfp, dstfp); err != nil {
+				fmt.Println(err)
+			}
+		}
+	}
+	return nil
+}
+
+func file(src, dst string) error {
+	var err error
+	var srcfd *os.File
+	var dstfd *os.File
+	var srcinfo os.FileInfo
+
+	if srcfd, err = os.Open(src); err != nil {
+		return err
+	}
+	defer srcfd.Close()
+
+	if dstfd, err = os.Create(dst); err != nil {
+		return err
+	}
+	defer dstfd.Close()
+
+	if _, err = io.Copy(dstfd, srcfd); err != nil {
+		return err
+	}
+	if srcinfo, err = os.Stat(src); err != nil {
+		return err
+	}
+	return os.Chmod(dst, srcinfo.Mode())
+}
+
+// END Git Functions
 
 // function to clone policy-template repo to current working directory
 func git_clone() {
@@ -106,7 +302,7 @@ func connectToK8s() *kubernetes.Clientset {
 }
 
 // Function to create strings from key-value pairs
-func createKeyValuePairs(m map[string]string, disp bool) string {
+func createKeyValuePairs(m map[string]string, disp bool, namespace string) string {
 
 	log.Info("Started map to string conversion on labels")
 
@@ -115,15 +311,16 @@ func createKeyValuePairs(m map[string]string, disp bool) string {
 		for key, value := range m {
 			if strings.Contains(key, keyword) || strings.Contains(value, keyword) {
 				fmt.Fprintf(b, "%s: %s\n\t\t\t\t\t", key, value)
-			} else if tags != "" && keyword == "" {
+			} else if tags == "" && keyword == "" {
 				fmt.Fprintf(b, "%s: %s\n\t\t\t\t\t", key, value)
 			}
 		}
+
 	} else {
 		for key, value := range m {
 			if strings.Contains(key, keyword) || strings.Contains(value, keyword) {
 				fmt.Fprintf(b, "%s: %s\n      ", key, value)
-			} else if tags != "" && keyword == "" {
+			} else if tags == "" && keyword == "" {
 				fmt.Fprintf(b, "%s: %s\n      ", key, value)
 			}
 		}
@@ -132,19 +329,30 @@ func createKeyValuePairs(m map[string]string, disp bool) string {
 }
 
 // FUnction to search files with .yaml extension under policy-template folder
-func policy_search(namespace string, labels string) {
+func policy_search(namespace string, labels string, search string) {
 
 	log.Info("Started searching for files with .yaml extension under policy-template folder")
 
 	err := filepath.Walk(git_dir, func(path string, info os.FileInfo, err error) error {
+		log.Info("git directory accessed : " + git_dir)
 		if err != nil {
 			log.Error(err)
 			return err
 		}
 		if strings.Contains(path, ".yaml") {
 			label_count = 0
-			policy_read(path, namespace, labels)
+			policy_read(path, namespace, labels, search)
 		}
+		return nil
+	})
+	if err != nil {
+		log.Error(err)
+		fmt.Printf("[%s] Oops! No files found with .yaml extension. Please try again later.\n", color.RedString("ERR"))
+	}
+	err = filepath.Walk(ad_dir, func(path string, info os.FileInfo, err error) error {
+		log.Info("Started Policy search : " + path + " with labels '" + labels + "' and search '" + search + "'")
+
+		CopyDir(ad_dir, repo_path)
 		return nil
 	})
 	if err != nil {
@@ -153,16 +361,16 @@ func policy_search(namespace string, labels string) {
 	}
 }
 
-func policy_read(policy_name string, namespace string, labels string) {
+func policy_read(policy_name string, namespace string, labels string, search string) {
 
-	log.Info("Started Policy search with keyword '" + keyword + "' and tags '" + tags + "'")
+	log.Info("Started Policy search : " + policy_name + " with labels '" + labels + "' and search '" + search + "'")
 
 	content, err := os.ReadFile(policy_name)
 	if err != nil {
 		log.Error(err)
 	}
 
-	if strings.Contains(string(content), tags) && tags != "" {
+	if strings.Contains(string(content), search) {
 
 		file, err := os.Open(policy_name)
 		if err != nil {
@@ -172,6 +380,16 @@ func policy_read(policy_name string, namespace string, labels string) {
 		var text []string
 		text = append(text, "---")
 		for scanner.Scan() {
+			if strings.Contains(string(scanner.Text()), "name:") {
+				policy_val := strings.FieldsFunc(string(scanner.Text()), Split)
+				git_policy_name = policy_val[1] + "-" + shortID(7)
+				text = append(text, string(scanner.Text())+"-"+shortID(7))
+				for scanner.Scan() {
+					if strings.Contains(string(scanner.Text()), "namespace:") {
+						break
+					}
+				}
+			}
 			if strings.Contains(string(scanner.Text()), "namespace:") {
 				text = append(text, "  namespace: "+namespace)
 				for scanner.Scan() {
@@ -184,7 +402,7 @@ func policy_read(policy_name string, namespace string, labels string) {
 				text = append(text, "    matchLabels:\n      "+labels)
 				label_count = 1
 				for scanner.Scan() {
-					if strings.Contains(string(scanner.Text()), "file:") || strings.Contains(string(scanner.Text()), "process:") || strings.Contains(string(scanner.Text()), "network:") || strings.Contains(string(scanner.Text()), "capabilities:") || strings.Contains(string(scanner.Text()), "ingress") || strings.Contains(string(scanner.Text()), "egress") {
+					if strings.Contains(string(scanner.Text()), "file:") || strings.Contains(string(scanner.Text()), "process:") || strings.Contains(string(scanner.Text()), "network:") || strings.Contains(string(scanner.Text()), "capabilities:") || strings.Contains(string(scanner.Text()), "ingress:") || strings.Contains(string(scanner.Text()), "egress:") {
 						break
 					}
 				}
@@ -193,6 +411,12 @@ func policy_read(policy_name string, namespace string, labels string) {
 		}
 
 		file.Close()
+
+		policy_updated, err = os.OpenFile(git_repo_path+git_policy_name+".yaml", os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Error(err)
+			return
+		}
 
 		for _, each_ln := range text {
 			_, err = fmt.Fprintln(policy_updated, each_ln)
@@ -214,6 +438,7 @@ func policy_read(policy_name string, namespace string, labels string) {
 		text = append(text, "---")
 		for scanner.Scan() {
 			if strings.Contains(string(scanner.Text()), "namespace:") {
+
 				text = append(text, "  namespace: "+namespace)
 				for scanner.Scan() {
 					if strings.Contains(string(scanner.Text()), "spec:") {
@@ -235,6 +460,12 @@ func policy_read(policy_name string, namespace string, labels string) {
 
 		file.Close()
 
+		policy_updated, err = os.OpenFile(git_repo_path+git_policy_name+".yaml", os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Error(err)
+			return
+		}
+
 		for _, each_ln := range text {
 			_, err = fmt.Fprintln(policy_updated, each_ln)
 			if err != nil {
@@ -245,96 +476,195 @@ func policy_read(policy_name string, namespace string, labels string) {
 
 }
 
+var chars = "abcdefghijklmnopqrstuvwxyz1234567890-"
+
+func shortID(length int) string {
+	ll := len(chars)
+	b := make([]byte, length)
+	rand.Read(b) // generates len(b) random bytes
+	for i := 0; i < length; i++ {
+		b[i] = chars[int(b[i])%ll]
+	}
+	return string(b)
+}
+
 func k8s_apply(path string) {
 
-	log.Info("Trying to establish connection to k8s")
-	home, exists := os.LookupEnv("HOME")
-	if !exists {
-		home = "/root"
-	}
+	if autoapply == true {
+		log.Info("auto-apply = " + strconv.FormatBool(autoapply))
 
-	configPath := filepath.Join(home, ".kube", "config")
-
-	config, err := clientcmd.BuildConfigFromFlags("", configPath)
-	if err != nil {
-		log.Error("failed to create K8s config")
-	}
-
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		log.Error("Failed to create K8s clientset")
-		fmt.Printf("[%s] Failed to create Kubernetes Clientset.\n", color.RedString("ERR"))
-
-	}
-	log.Info(clientset)
-
-	b, err := ioutil.ReadFile(path)
-	if err != nil {
-		log.Error(err)
-	}
-
-	dd, err := dynamic.NewForConfig(config)
-	if err != nil {
-		log.Error(err)
-	}
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
-	if err != nil {
-		panic(err.Error())
-	}
-
-	decoder := yamlutil.NewYAMLOrJSONDecoder(bytes.NewReader(b), 100)
-	for {
-		s.Prefix = "Applied " + strconv.Itoa(policy_count) + " policies. Please wait.."
-		s.Start()
-		time.Sleep(4 * time.Second)
-		var rawObj runtime.RawExtension
-		if err = decoder.Decode(&rawObj); err != nil {
-			break
+		log.Info("Trying to establish connection to k8s")
+		home, exists := os.LookupEnv("HOME")
+		if !exists {
+			home = "/root"
 		}
 
-		obj, gvk, err := yaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme).Decode(rawObj.Raw, nil, nil)
-		unstructuredMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+		configPath := filepath.Join(home, ".kube", "config")
+
+		config, err := clientcmd.BuildConfigFromFlags("", configPath)
+		if err != nil {
+			log.Error("failed to create K8s config")
+		}
+
+		clientset, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			log.Error("Failed to create K8s clientset")
+			fmt.Printf("[%s] Failed to create Kubernetes Clientset.\n", color.RedString("ERR"))
+
+		}
+		log.Info(clientset)
+
+		b, err := ioutil.ReadFile(path)
 		if err != nil {
 			log.Error(err)
 		}
 
-		unstructuredObj := &unstructured.Unstructured{Object: unstructuredMap}
-
-		gr, err := restmapper.GetAPIGroupResources(clientset.Discovery())
+		dd, err := dynamic.NewForConfig(config)
 		if err != nil {
 			log.Error(err)
 		}
-
-		mapper := restmapper.NewDiscoveryRESTMapper(gr)
-		mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+		discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 		if err != nil {
-			log.Error(err)
-			fmt.Printf("[%s] Error: %v\n", color.RedString("ERR"), err)
-		} else {
-			policy_count++
+			panic(err.Error())
 		}
+		log.Info(discoveryClient)
 
-		var dri dynamic.ResourceInterface
-		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
-			if unstructuredObj.GetNamespace() == "" {
-				unstructuredObj.SetNamespace("default")
+		var namespaceNames string
+		namespaceNames = ""
+		//Fetch the NamespaceNames using NamespaceID
+
+		Decoder := yamlutil.NewYAMLOrJSONDecoder(bytes.NewReader(b), 98)
+		for {
+			var rawObject runtime.RawExtension
+			if err = Decoder.Decode(&rawObject); err != nil {
+				log.Warn("decoding not possible because " + err.Error())
+
 			}
-			dri = dd.Resource(mapping.Resource).Namespace(unstructuredObj.GetNamespace())
-		} else {
-			dri = dd.Resource(mapping.Resource)
-		}
-		log.Info(dri)
-		applyOptions := apply.NewApplyOptions(dd, discoveryClient)
-		if err := applyOptions.Apply(context.TODO(), []byte(b)); err != nil {
-			log.Error("Apply error: %v", err)
-			fmt.Printf("[%s] Error in Applying Policy\n", color.RedString("ERR"))
-		}
+			//decode yaml into unstructured.Unstructured and get Group version kind
+			object, gvk, err := yaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme).Decode(rawObject.Raw, nil, nil)
+			unstructuredMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(object)
+			if err != nil {
+				log.Warn("Error in Unstructuredmap because " + err.Error())
+			}
 
+			unstructuredObject := &unstructured.Unstructured{Object: unstructuredMap}
+			grs, err := restmapper.GetAPIGroupResources(clientset.DiscoveryClient)
+			if err != nil {
+				log.Warn("Unable to Get API Group resource because " + err.Error())
+			}
+
+			//Get Group version resource using Group version kind
+			rMapper := restmapper.NewDiscoveryRESTMapper(grs)
+			log.Info("Group  Kind :  " + fmt.Sprint(gvk.GroupKind()))
+			log.Info("Version :  " + fmt.Sprint(gvk.Version))
+			mapping, err := rMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+			if err != nil {
+				log.Warn("unexpected error getting mapping for Group version resource " + err.Error())
+			}
+
+			// Obtain REST interface for the Group version resource and checking for namespace or cluster wide resource
+			var dri dynamic.ResourceInterface
+
+			if gvk.Kind == KUBEARMORHOST_POLICY {
+				if namespaceNames != "" {
+					dri = dd.Resource(mapping.Resource)
+
+				} else {
+
+					dri = dd.Resource(mapping.Resource)
+				}
+			} else if gvk.Kind == CILIUM_KIND_NODE_LABEL {
+				if namespaceNames != "" {
+
+					dri = dd.Resource(mapping.Resource)
+				}
+			} else {
+
+				dri = dd.Resource(mapping.Resource).Namespace(unstructuredObject.GetNamespace())
+			}
+
+			//To Create or update the policy get the name of the policy which is to be applied and check exist or not
+
+			getObj, err := dri.Get(context.TODO(), unstructuredObject.GetName(), v1.GetOptions{})
+
+			// if policy is not applied or found, create the policy in cluster
+			if err != nil && errors.IsNotFound(err) {
+				_, err = dri.Create(context.Background(), unstructuredObject, v1.CreateOptions{})
+				if err != nil {
+					log.Warn("Policy Creation is failed " + err.Error())
+				}
+				log.Info("Policy Apply Successfully")
+			} else {
+				//Update the policy in cluster
+				unstructuredObject.SetResourceVersion(getObj.GetResourceVersion())
+				_, err = dri.Update(context.TODO(), unstructuredObject, v1.UpdateOptions{})
+				if err != nil {
+					log.Warn("Policy Updation is failed " + err.Error())
+				}
+				log.Info("Policy Updated Successfully")
+			}
+
+			/*
+				decoder := yamlutil.NewYAMLOrJSONDecoder(bytes.NewReader(b), 100)
+				for {
+					s.Prefix = "Applied " + strconv.Itoa(policy_count) + " policies. Please wait.."
+					s.Start()
+					time.Sleep(4 * time.Second)
+					var rawObj runtime.RawExtension
+					if err = decoder.Decode(&rawObj); err != nil {
+						break
+					}
+
+					obj, gvk, err := yaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme).Decode(rawObj.Raw, nil, nil)
+					unstructuredMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+					if err != nil {
+						log.Error(err)
+					}
+
+					unstructuredObj := &unstructured.Unstructured{Object: unstructuredMap}
+
+					gr, err := restmapper.GetAPIGroupResources(clientset.Discovery())
+					if err != nil {
+						log.Error(err)
+					}
+
+					mapper := restmapper.NewDiscoveryRESTMapper(gr)
+					mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+					if err != nil {
+						log.Error(err)
+						fmt.Printf("[%s] Error: %v\n", color.RedString("ERR"), err)
+					} else {
+						policy_count++
+					}
+
+					var dri dynamic.ResourceInterface
+					if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+						if unstructuredObj.GetNamespace() == "" {
+							unstructuredObj.SetNamespace("default")
+						}
+						dri = dd.Resource(mapping.Resource).Namespace(unstructuredObj.GetNamespace())
+					} else {
+						dri = dd.Resource(mapping.Resource)
+					}
+					log.Info(dri)
+					applyOptions := apply.NewApplyOptions(dd, discoveryClient)
+					if err := applyOptions.Apply(context.TODO(), []byte(b)); err != nil {
+						log.Error("Apply error: %v", err)
+						fmt.Printf("[%s] Error in Applying Policy\n", color.RedString("ERR"))
+					}
+
+				}
+			*/
+		}
+		if err != io.EOF {
+			log.Error("End of File ", err)
+		}
+		s.Stop()
+	} else {
+		log.Warn("auto-apply = " + strconv.FormatBool(autoapply))
+		fmt.Printf("[%s] Auto apply is false. Halting the program\n", color.RedString("WRN"))
 	}
-	if err != io.EOF {
-		log.Error("End of File ", err)
-	}
-	s.Stop()
+
 }
 
 func k8s_labels(flag bool) {
@@ -347,28 +677,15 @@ func k8s_labels(flag bool) {
 	}
 	var temp []string
 	var count int = 0
-	if tags == "" && keyword != "" {
-		s.Prefix = "Searching the Kubernetes Cluster for keyword " + keyword + ". Please wait.. "
-	} else if tags != "" && keyword != "" {
-		s.Prefix = "Searching the Kubernetes Cluster for keyword " + keyword + " and tags " + tags + ". Please wait.. "
-	} else {
-		s.Prefix = "Searching the Kubernetes Cluster for labels. Please wait.. "
-	}
 	for _, pod := range pods.Items {
-		if !strings.Contains(pod.GetNamespace(), "kube-system") {
-			s.Start()
-			time.Sleep(4 * time.Second)
-			if createKeyValuePairs(pod.GetLabels(), true) != "" {
-				temp = append(temp, createKeyValuePairs(pod.GetLabels(), true))
-				count++
-			}
+		if createKeyValuePairs(pod.GetLabels(), true, pod.GetNamespace()) != "" {
+			temp = append(temp, createKeyValuePairs(pod.GetLabels(), true, pod.GetNamespace()))
+			count++
 		}
 	}
-	s.Stop()
-
 	if count == 0 {
 		fmt.Printf("[%s] No labels found in the cluster. Gracefully exiting program.\n", color.RedString("ERR"))
-		os.Exit(0)
+		os.Exit(1)
 	} else {
 		fmt.Printf("[%s][%s] Found %d Labels\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("Label Count"), count)
 	}
@@ -378,34 +695,51 @@ func k8s_labels(flag bool) {
 		fmt.Printf("[%s][%s]    %s\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("Label Details"), val)
 		log.Info("Label values: ", item)
 	}
-	if tags == "" && keyword != "" {
-		s.Prefix = "Searching the Kubernetes Cluster for keyword " + keyword + ". Please wait.. "
+	if tags == "" && keyword == "" {
+		s.Prefix = "Searching the Kubernetes Cluster for workloads. Please wait.. "
 	} else if tags != "" && keyword != "" {
 		s.Prefix = "Searching the Kubernetes Cluster for keyword " + keyword + " and tags " + tags + ". Please wait.. "
 	}
-	s.Start()
-	time.Sleep(4 * time.Second)
 	for _, pod := range pods.Items {
-		labels := createKeyValuePairs(pod.GetLabels(), false)
+		labels := createKeyValuePairs(pod.GetLabels(), false, pod.GetNamespace())
 		labels = strings.TrimSuffix(labels, "\n      ")
+		searchVal := strings.FieldsFunc(labels, Split)
 		if labels != "" {
-			if !strings.Contains(pod.GetNamespace(), "kube-system") {
-				//	fmt.Printf("[%s][%s] Pod: %s || Labels: %s || Namespace: %s\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("Label Details"), pod.GetName(), labels, pod.GetNamespace())
-				policy_search(pod.GetNamespace(), labels)
+			//	fmt.Printf("[%s][%s] Pod: %s || Labels: %s || Namespace: %s\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("Label Details"), pod.GetName(), labels, pod.GetNamespace())
+			for i := 0; i < len(searchVal); i++ {
+				i++
+				policy_search(pod.GetNamespace(), labels, searchVal[i])
 			}
 		}
 	}
-	s.Stop()
 	fmt.Printf("[%s][%s] Policy file created at %s\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("File Details"), color.GreenString(current_dir+"/policy_updated.yaml"))
 	if flag == false {
 		log.Info("Received flag value false")
 
 		fmt.Printf("[%s][%s] Halting execution because auto-apply is not enabled\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.CyanString("WRN"))
-		os.Exit(0)
 	}
 	fmt.Printf("[%s][%s] Started applying policies\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("INIT"))
-	k8s_apply(current_dir + "/policy_updated.yaml")
 
+	err = filepath.Walk(git_repo_path, func(path string, info os.FileInfo, err error) error {
+		log.Info("git directory accessed : " + git_repo_path)
+		if err != nil {
+			log.Error(err)
+			return err
+		}
+		if strings.Contains(path, ".yaml") {
+			k8s_apply(path)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Error(err)
+		fmt.Printf("[%s] Oops! No files found with .yaml extension. Please try again later.\n", color.RedString("ERR"))
+	}
+
+}
+
+func Split(r rune) bool {
+	return r == ':' || r == '\n'
 }
 
 func banner() {
@@ -447,6 +781,68 @@ func delete_all() {
 		fmt.Printf("[%s] Unable to remove folder %s\n", color.RedString("ERR"), git_dir)
 	}
 }
+func auto_discover() {
+	fileUrl := "https://raw.githubusercontent.com/accuknox/tools/main/install.sh"
+	err := DownloadFile("install.sh", fileUrl)
+	if err != nil {
+		log.Warn(err)
+	}
+	fmt.Println("Downloaded: " + fileUrl)
+	command_query := "install.sh"
+	cmd := exec.Command("/bin/bash", command_query)
+	stdout, err := cmd.Output()
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	fmt.Println(string(stdout))
+	log.Info(stdout)
+	ad_dir = current_dir + "/ad-policy"
+	if _, err := os.Stat(ad_dir); os.IsNotExist(err) {
+		os.Mkdir(ad_dir, os.ModeDir|0755)
+	}
+
+	os.Chdir(ad_dir)
+	log.Info("ad directory :" + ad_dir)
+
+	fileUrl = "https://raw.githubusercontent.com/accuknox/tools/main/get_discovered_yamls.sh"
+	err = DownloadFile("get_discovered_yamls.sh", fileUrl)
+	if err != nil {
+		log.Warn(err)
+	}
+	fmt.Println("Downloaded: " + fileUrl)
+	command_query = "get_discovered_yamls.sh"
+	cmd = exec.Command("/bin/bash", command_query)
+	stdout, err = cmd.Output()
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	fmt.Println(string(stdout))
+	log.Info(stdout)
+	os.Chdir(current_dir)
+
+}
+func DownloadFile(filepath string, url string) error {
+
+	// Get the data
+	resp, err := myhttp.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Create the file
+	out, err := os.Create(filepath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	// Write the body to file
+	_, err = io.Copy(out, resp.Body)
+	return err
+}
 
 var version string = "1.0.0"
 var policy_updated *os.File
@@ -471,16 +867,10 @@ func main() {
 	if err != nil {
 		log.Error(err)
 	}
-
+	git_repo_path = current_dir + "/updated_policy/"
 	user_home, err = os.UserHomeDir()
 	if err != nil {
 		log.Error(err)
-	}
-
-	policy_updated, err = os.OpenFile("policy_updated.yaml", os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Error(err)
-		return
 	}
 
 	// adding policy-template directory to current working directory
@@ -488,13 +878,15 @@ func main() {
 
 	log.Info("Current Working directory: " + current_dir)
 	log.Info("Github clone directory: " + git_dir)
-	log.Info("Current Working directory: " + user_home)
+	log.Info("User Home directory: " + user_home)
+	tags = ""
+	keyword = ""
 
 	myFlags := []cli.Flag{
 		&cli.StringFlag{
-			Name:        "keyword",
-			Aliases:     []string{"k"},
-			Usage:       "Keyword to search. Example 'wordpress'",
+			Name:        "git_username",
+			Aliases:     []string{"git_user"},
+			Usage:       "GitHub username",
 			EnvVars:     []string{},
 			FilePath:    "",
 			Required:    false,
@@ -506,9 +898,9 @@ func main() {
 			HasBeenSet:  false,
 		},
 		&cli.StringFlag{
-			Name:        "tags",
-			Aliases:     []string{"t"},
-			Usage:       "Tags to search. Example 'MITRE'",
+			Name:        "git_repo_url",
+			Aliases:     []string{"git_url"},
+			Usage:       "GitHub URL to push the updates",
 			EnvVars:     []string{},
 			FilePath:    "",
 			Required:    false,
@@ -519,17 +911,32 @@ func main() {
 			Destination: new(string),
 			HasBeenSet:  false,
 		},
-		&cli.BoolFlag{
-			Name:        "persist",
-			Aliases:     []string{"p"},
-			Usage:       "If true, all logs and modified YAML will be persisted on disk",
+		&cli.StringFlag{
+			Name:        "git_token",
+			Aliases:     []string{"token"},
+			Usage:       "GitHub token for authentication",
 			EnvVars:     []string{},
 			FilePath:    "",
 			Required:    false,
 			Hidden:      false,
-			Value:       true,
+			TakesFile:   false,
+			Value:       "",
 			DefaultText: "",
-			Destination: new(bool),
+			Destination: new(string),
+			HasBeenSet:  false,
+		},
+		&cli.StringFlag{
+			Name:        "git_branch_name",
+			Aliases:     []string{"branch"},
+			Usage:       "GitHub branch name for pushing updates",
+			EnvVars:     []string{},
+			FilePath:    "",
+			Required:    false,
+			Hidden:      false,
+			TakesFile:   false,
+			Value:       "",
+			DefaultText: "",
+			Destination: new(string),
 			HasBeenSet:  false,
 		},
 		&cli.BoolFlag{
@@ -548,54 +955,20 @@ func main() {
 	}
 	app := &cli.App{
 		Name:      "knox-autopol",
-		Usage:     "A simple CLI tool to automatically generate and apply policies",
+		Usage:     "A simple CLI tool to automatically generate and apply policies or push to GitHub",
 		Version:   version,
-		UsageText: "knox-autopol [Flags]\nEg. knox-autopol --keyword=wordpress --tags=mitre --auto-apply=true --persist=true",
+		UsageText: "knox-autopol [Flags]\nEg. knox-autopol --auto-apply=false --git_branch_name=temp-branch --git_token=gh_token123 --git_repo_url= https://github.com/testuser/demo.git --git_username=testuser",
 		Flags:     myFlags,
 		Action: func(c *cli.Context) error {
-			if c.String("keyword") == "" && c.String("tags") == "" && c.Bool("persist") == true && c.Bool("auto-apply") == false {
-
-				banner()
-				fmt.Printf("[%s] No Keyword or tags found. Please use knox_autopol --help for help menu\n", color.RedString("ERR"))
-
-			}
-			if c.String("keyword") != "" && c.String("tags") == "" {
-				keyword = c.String("keyword")
-				banner()
-				fmt.Printf("[%s] Using Knox AutoPol Engine %s\n", color.BlueString("INF"), color.GreenString(version))
-				git_operation()
-				k8s_labels(c.Bool("auto-apply"))
-				if c.Bool("persist") == false {
-					delete_all()
-				}
-				fmt.Printf("[%s][%s] Successfully applied %d policies\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.GreenString("DONE"), policy_count)
-
-			} else if c.String("keyword") == "" && c.String("tags") != "" {
-
-				tags = c.String("tags")
-				banner()
-				fmt.Printf("[%s] Using Knox AutoPol Engine %s\n", color.BlueString("INF"), color.GreenString(version))
-				git_operation()
-				k8s_labels(c.Bool("auto-apply"))
-				if c.Bool("persist") == false {
-					delete_all()
-				}
-				fmt.Printf("[%s][%s] Successfully applied %d policies\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.GreenString("DONE"), policy_count)
-
-			} else if c.String("keyword") != "" && c.String("tags") != "" {
-
-				keyword = c.String("keyword")
-				tags = c.String("tags")
-				banner()
-				fmt.Printf("[%s] Using Knox AutoPol Engine %s\n", color.BlueString("INF"), color.GreenString(version))
-				git_operation()
-				k8s_labels(c.Bool("auto-apply"))
-				if c.Bool("persist") == false {
-					delete_all()
-				}
-				fmt.Printf("[%s][%s] Successfully applied %d policies\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.GreenString("DONE"), policy_count)
-
-			}
+			git_username = c.String("git_username")
+			git_token = c.String("git_token")
+			git_repo_url = c.String("git_repo_url")
+			git_branch_name = c.String("git_branch_name")
+			autoapply = c.Bool("auto-apply")
+			banner()
+			git_operation()
+			auto_discover()
+			Init_Git(git_username, git_token, git_repo_url, git_branch_name)
 			return nil
 		},
 	}
@@ -606,4 +979,5 @@ func main() {
 	if err != nil {
 		log.Error(err)
 	}
+
 }

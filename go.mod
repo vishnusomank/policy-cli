@@ -7,6 +7,7 @@ require (
 	github.com/common-nighthawk/go-figure v0.0.0-20210622060536-734e95fb86be
 	github.com/fatih/color v1.13.0
 	github.com/go-git/go-git/v5 v5.4.2
+	github.com/google/go-github v17.0.0+incompatible
 	github.com/sirupsen/logrus v1.8.1
 	k8s.io/apimachinery v0.23.5
 	k8s.io/client-go v0.23.5
@@ -15,6 +16,7 @@ require (
 require (
 	github.com/antzucaro/matchr v0.0.0-20210222213004-b04723ef80f0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.1 // indirect
+	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/onsi/ginkgo v1.14.1 // indirect
 	github.com/onsi/gomega v1.10.2 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
@@ -57,7 +59,7 @@ require (
 	github.com/xanzy/ssh-agent v0.3.0 // indirect
 	golang.org/x/crypto v0.0.0-20210817164053-32db794688a5 // indirect
 	golang.org/x/net v0.0.0-20211209124913-491a49abca63 // indirect
-	golang.org/x/oauth2 v0.0.0-20210819190943-2bc19b11175f // indirect
+	golang.org/x/oauth2 v0.0.0-20210819190943-2bc19b11175f
 	golang.org/x/sys v0.0.0-20210831042530-f4d43177bf5e // indirect
 	golang.org/x/term v0.0.0-20210615171337-6886f2dfbf5b // indirect
 	golang.org/x/text v0.3.7 // indirect

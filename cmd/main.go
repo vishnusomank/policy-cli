@@ -18,6 +18,11 @@ import (
 
 	"os/exec"
 
+	"github.com/google/go-github/github"
+	"golang.org/x/oauth2"
+
+	myerrors "errors"
+
 	myhttp "net/http"
 
 	"github.com/briandowns/spinner"
@@ -41,6 +46,14 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/client-go/restmapper"
 	clientcmd "k8s.io/client-go/tools/clientcmd"
+)
+
+var (
+	client                  *github.Client
+	NotMergableError        = myerrors.New("Not mergable")
+	BranchNotFoundError     = myerrors.New("Branch not found")
+	NonDeletableBranchError = myerrors.New("Branch cannot be deleted")
+	PullReqNotFoundError    = myerrors.New("Pull request not found")
 )
 
 const CREATE = "Create"
@@ -77,6 +90,15 @@ const repo_path = "/tmp/accuknox-client-repo"
 
 func Init_Git(username string, token string, repo_url string, branch_name string) {
 
+	s := strings.Split(repo_url, "/")
+	var repoName string
+
+	for i := 0; i < len(s); i++ {
+		if strings.Contains(s[i], ".git") {
+			repoName = strings.Split(s[i], ".")[0]
+		}
+	}
+
 	r := GitClone(username, token, repo_url, repo_path)
 
 	createBranch(r, username, token, branch_name)
@@ -85,14 +107,16 @@ func Init_Git(username string, token string, repo_url string, branch_name string
 	pushToGithub(r, username, token)
 	fmt.Printf("Pushed to the github repo %v\n", repo_url)
 
+	createPRToGit(token, branch_name, username, repoName)
+
 	removeLocalRepo()
 }
 
 func GitClone(username string, token string, repo_url string, repo_path string) *git.Repository {
 
-	create_dir := os.Mkdir(repo_path, 0755)
-
-	checkError(create_dir)
+	if _, err := os.Stat(repo_path); os.IsNotExist(err) {
+		os.Mkdir(repo_path, 0755)
+	}
 
 	auth := &http.BasicAuth{
 		Username: username,
@@ -100,8 +124,9 @@ func GitClone(username string, token string, repo_url string, repo_path string) 
 	}
 
 	r, _ := git.PlainClone(repo_path, false, &git.CloneOptions{
-		URL:  repo_url,
-		Auth: auth,
+		URL:           repo_url,
+		ReferenceName: plumbing.ReferenceName(fmt.Sprintf("refs/heads/%s", "dev-deploy")),
+		Auth:          auth,
 	})
 
 	return r
@@ -114,10 +139,10 @@ func createBranch(r *git.Repository, username string, token string, branch_name 
 	err := w.Checkout(&git.CheckoutOptions{
 		Create: true,
 		Force:  false,
-		Branch: "main",
+		Branch: "dev-deploy",
 	})
 
-	checkError(err)
+	checkError(err, "create branch: checkout dev-deploy")
 
 	branchName := plumbing.ReferenceName("refs/heads/" + branch_name)
 
@@ -127,10 +152,11 @@ func createBranch(r *git.Repository, username string, token string, branch_name 
 		Branch: branchName,
 	})
 
-	checkError(err)
-	create_dir := os.Mkdir(git_repo_path, 0755)
+	checkError(err, "create branch: checkout "+branch_name)
 
-	checkError(create_dir)
+	if _, err := os.Stat(git_repo_path); os.IsNotExist(err) {
+		os.Mkdir(git_repo_path, 0755)
+	}
 	k8s_labels(autoapply)
 
 	CopyDir(git_repo_path, repo_path)
@@ -158,20 +184,83 @@ func pushToGithub(r *git.Repository, username, password string) {
 		Force:      true,
 	})
 
-	checkError(err)
+	checkError(err, "pushtogit error")
+}
+
+func newClient(token string) *github.Client {
+	ctx := context.Background()
+	ts := oauth2.StaticTokenSource(
+		&oauth2.Token{AccessToken: token},
+	)
+	tc := oauth2.NewClient(ctx, ts)
+	return github.NewClient(tc)
+
+}
+
+func createPRToGit(token string, branchName string, username string, repoName string) {
+
+	newPR := &github.NewPullRequest{
+		Title:               github.String("PR from KnoxAutoPol CLI"),
+		Head:                github.String(branchName),
+		Base:                github.String("dev-deploy"),
+		Body:                github.String("This is an automated PR created by KnoxAutoPol CLI"),
+		MaintainerCanModify: github.Bool(true),
+	}
+
+	pr, _, err := client.PullRequests.Create(context.Background(), username, repoName, newPR)
+	if err != nil {
+		fmt.Println("There is a Git Error " + err.Error())
+		return
+	}
+
+	fmt.Printf("PR created: %s\n", pr.GetHTMLURL())
+	s := strings.Split(pr.GetHTMLURL(), "/")
+	mergePullRequest(username, repoName, s[len(s)-1], token)
+
+}
+
+func stringToInt(number string) int {
+	intVal, err := strconv.Atoi(number)
+	if err != nil {
+		fmt.Printf("[%s] Oops! String to integer conversion failed\n", color.RedString("ERR"))
+		log.Warn(err)
+	}
+	return intVal
+}
+
+func mergePullRequest(owner, repo, number, token string) error {
+	fmt.Printf("Attempting to merge PR #%s on %s/%s...\n", number, owner, repo)
+
+	commitMsg := "Commit from Accuknox GitOps CLI"
+	_, _, mergeErr := client.PullRequests.Merge(
+		context.Background(),
+		owner,
+		repo,
+		stringToInt(number),
+		commitMsg,
+		&github.PullRequestOptions{},
+	)
+
+	if mergeErr != nil {
+		fmt.Println("Received an error!", mergeErr)
+	} else {
+		fmt.Printf("Successfully merged PR #%s on %s/%s...\n", number, owner, repo)
+
+	}
+
+	return nil
 }
 
 func removeLocalRepo() {
 
 	err := os.RemoveAll(repo_path)
-	checkError(err)
-	err = os.RemoveAll(git_repo_path)
-	checkError(err)
+	checkError(err, "removelocalrepo function")
 }
 
-func checkError(err error) {
+func checkError(err error, data string) {
 	if err != nil {
-		panic(err)
+		fmt.Printf("[%s] Oops! Error from \n"+data, color.RedString("ERR"))
+		log.Warn(err)
 	}
 }
 
@@ -382,7 +471,8 @@ func policy_read(policy_name string, namespace string, labels string, search str
 		for scanner.Scan() {
 			if strings.Contains(string(scanner.Text()), "name:") {
 				policy_val := strings.FieldsFunc(string(scanner.Text()), Split)
-				git_policy_name = policy_val[1] + "-" + shortID(7)
+				git_policy_name = strings.Replace(policy_val[1]+"-"+shortID(7), "\"", "", -1)
+
 				text = append(text, string(scanner.Text())+"-"+shortID(7))
 				for scanner.Scan() {
 					if strings.Contains(string(scanner.Text()), "namespace:") {
@@ -525,7 +615,8 @@ func k8s_apply(path string) {
 		}
 		discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 		if err != nil {
-			panic(err.Error())
+			fmt.Printf("[%s] Oops! discovery client creation failed\n", color.RedString("ERR"))
+			log.Warn(err.Error())
 		}
 		log.Info(discoveryClient)
 
@@ -662,7 +753,6 @@ func k8s_apply(path string) {
 		s.Stop()
 	} else {
 		log.Warn("auto-apply = " + strconv.FormatBool(autoapply))
-		fmt.Printf("[%s] Auto apply is false. Halting the program\n", color.RedString("WRN"))
 	}
 
 }
@@ -717,9 +807,9 @@ func k8s_labels(flag bool) {
 		log.Info("Received flag value false")
 
 		fmt.Printf("[%s][%s] Halting execution because auto-apply is not enabled\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.CyanString("WRN"))
+	} else {
+		fmt.Printf("[%s][%s] Started applying policies\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("INIT"))
 	}
-	fmt.Printf("[%s][%s] Started applying policies\n", color.BlueString(time.Now().Format("01-02-2006 15:04:05")), color.BlueString("INIT"))
-
 	err = filepath.Walk(git_repo_path, func(path string, info os.FileInfo, err error) error {
 		log.Info("git directory accessed : " + git_repo_path)
 		if err != nil {
@@ -797,6 +887,10 @@ func auto_discover() {
 	}
 	fmt.Println(string(stdout))
 	log.Info(stdout)
+	e := os.Remove(command_query)
+	if e != nil {
+		log.Fatal(e)
+	}
 	ad_dir = current_dir + "/ad-policy"
 	if _, err := os.Stat(ad_dir); os.IsNotExist(err) {
 		os.Mkdir(ad_dir, os.ModeDir|0755)
@@ -817,6 +911,10 @@ func auto_discover() {
 	if err != nil {
 		fmt.Println(err.Error())
 		return
+	}
+	e = os.Remove(command_query)
+	if e != nil {
+		log.Fatal(e)
 	}
 	fmt.Println(string(stdout))
 	log.Info(stdout)
@@ -965,6 +1063,7 @@ func main() {
 			git_repo_url = c.String("git_repo_url")
 			git_branch_name = c.String("git_branch_name")
 			autoapply = c.Bool("auto-apply")
+			client = newClient(git_token)
 			banner()
 			git_operation()
 			auto_discover()

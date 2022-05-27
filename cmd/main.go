@@ -82,7 +82,7 @@ var policy_count int = 0
 var label_count int = 0
 var autoapply bool
 
-var git_username, git_token, git_repo_url, git_branch_name, git_repo_path, git_policy_name string
+var git_username, git_token, git_repo_url, git_branch_name, git_repo_path, git_policy_name, git_base_branch string
 
 const repo_path = "/tmp/accuknox-client-repo"
 
@@ -125,7 +125,7 @@ func GitClone(username string, token string, repo_url string, repo_path string) 
 
 	r, _ := git.PlainClone(repo_path, false, &git.CloneOptions{
 		URL:           repo_url,
-		ReferenceName: plumbing.ReferenceName(fmt.Sprintf("refs/heads/%s", "dev-deploy")),
+		ReferenceName: plumbing.ReferenceName(fmt.Sprintf("refs/heads/%s", git_base_branch)),
 		Auth:          auth,
 	})
 
@@ -139,10 +139,10 @@ func createBranch(r *git.Repository, username string, token string, branch_name 
 	err := w.Checkout(&git.CheckoutOptions{
 		Create: true,
 		Force:  false,
-		Branch: "dev-deploy",
+		Branch: plumbing.ReferenceName(git_base_branch),
 	})
 
-	checkError(err, "create branch: checkout dev-deploy")
+	checkError(err, "create branch: checkout "+git_base_branch)
 
 	branchName := plumbing.ReferenceName("refs/heads/" + branch_name)
 
@@ -202,7 +202,7 @@ func createPRToGit(token string, branchName string, username string, repoName st
 	newPR := &github.NewPullRequest{
 		Title:               github.String("PR from KnoxAutoPol CLI"),
 		Head:                github.String(branchName),
-		Base:                github.String("dev-deploy"),
+		Base:                github.String(git_base_branch),
 		Body:                github.String("This is an automated PR created by KnoxAutoPol CLI"),
 		MaintainerCanModify: github.Bool(true),
 	}
@@ -1037,6 +1037,20 @@ func main() {
 			Destination: new(string),
 			HasBeenSet:  false,
 		},
+		&cli.StringFlag{
+			Name:        "git_base_branch",
+			Aliases:     []string{"basebranch"},
+			Usage:       "GitHub base branch name for PR creation",
+			EnvVars:     []string{},
+			FilePath:    "",
+			Required:    false,
+			Hidden:      false,
+			TakesFile:   false,
+			Value:       "",
+			DefaultText: "",
+			Destination: new(string),
+			HasBeenSet:  false,
+		},
 		&cli.BoolFlag{
 			Name:        "auto-apply",
 			Aliases:     []string{"auto"},
@@ -1055,7 +1069,7 @@ func main() {
 		Name:      "knox-autopol",
 		Usage:     "A simple CLI tool to automatically generate and apply policies or push to GitHub",
 		Version:   version,
-		UsageText: "knox-autopol [Flags]\nEg. knox-autopol --auto-apply=false --git_branch_name=temp-branch --git_token=gh_token123 --git_repo_url= https://github.com/testuser/demo.git --git_username=testuser",
+		UsageText: "knox-autopol [Flags]\nEg. knox-autopol --git_base_branch=deploy-branch --auto-apply=false --git_branch_name=temp-branch --git_token=gh_token123 --git_repo_url= https://github.com/testuser/demo.git --git_username=testuser",
 		Flags:     myFlags,
 		Action: func(c *cli.Context) error {
 			git_username = c.String("git_username")
@@ -1064,6 +1078,7 @@ func main() {
 			git_branch_name = c.String("git_branch_name")
 			autoapply = c.Bool("auto-apply")
 			client = newClient(git_token)
+			git_base_branch = c.String("git_base_branch")
 			banner()
 			git_operation()
 			auto_discover()
